@@ -7,7 +7,7 @@ Translate your Renpy game with LLM.
 Install dependencies:
 
 ```bash
-pip install -r requirements.txt
+uv sync
 ```
 
 Create a `.env` file based on `.env.example` and fill the info as needed:
@@ -23,13 +23,13 @@ The API needs to be compatible with OpenAI API.
 Show help message:
 
 ```bash
-python main.py -h
+uv run main.py -h
 ```
 
 Run translation:
 
 ```bash
-python main.py ./test_data/ ./test_out/ --lang chinese
+uv run main.py ./test_data/ ./test_out/ --lang chinese
 ```
 
 The translator will recursively translate all the `.rpy` files in the source folder and write to the target folder,
@@ -84,7 +84,7 @@ Generate translation with Renpy SDK (GUI), e.g., `zh_cn`.
 Run translation:
 
 ```bash
-python main.py /path/to/game/tl/zh_cn/ /path/to/game/tl/zh_cn/ --lang target_language
+uv run main.py /path/to/game/tl/zh_cn/ /path/to/game/tl/zh_cn/ --lang target_language
 ```
 
 This will translate and replace the `.rpy` files in the `game/tl/zh_cn` folder.

@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import re
 from pathlib import Path
@@ -14,13 +15,34 @@ load_dotenv()
 LLM_BASE_URL = os.environ['LLM_BASE_URL']
 LLM_API_KEY = os.environ['LLM_API_KEY']
 LLM_MODEL = os.environ['LLM_MODEL']
+DEBUG = os.environ['DEBUG']
 MAX_RETRIES = 3
 TIMEOUT = 300  # seconds
 
-# LLM client
+# ANSI codes for colored terminal output
+CYAN = '\033[36m'
+GREEN = '\033[32m'
+RESET = '\033[0m'
+
+# Mapping dictionary for Batch mode (Folder -> Language Name)
+# You can expand or modify this map according to your needs.
+LANGUAGE_MAP = {
+    'brazilian': 'Brazilian Portuguese',
+    'german': 'German',
+    'latam': 'Spanish (Latin America)',
+    'russian': 'Russian',
+    'schinese': 'Simplified Chinese',
+    'spanish': 'Spanish',
+    'tchinese': 'Traditional Chinese',
+}
+
+# LLM Client
 client = OpenAI(
     api_key=LLM_API_KEY, base_url=LLM_BASE_URL, max_retries=MAX_RETRIES, timeout=TIMEOUT
 )
+
+if DEBUG == 'True':
+    print(f'Debug Enabled')
 
 
 # ========================
@@ -29,301 +51,249 @@ client = OpenAI(
 def extract_translatable_blocks(content):
     """
     Splits .rpy content into translatable blocks (dialogue + metadata).
-    Returns list of dicts with keys: 'text', 'line_number', 'tags'.
+    Returns a list of dicts with keys: 'id', 'text', 'line_number', 'raw_line'.
     """
     blocks = []
     lines = content.split('\n')
 
+    # Simple regex to catch `new "text"` blocks inside translate blocks or string translations
+    # Matches `new "Anything inside quotes"`
+    pattern = re.compile(r'^\s*new\s+"((?:\\.|[^"\\])*)"')
+
     for i, line in enumerate(lines):
-        # Match dialogue with an explicit display name (e.g., `"Eileen" "Hello" nointeract`)
-        explicit_name_match = re.match(
-            r'^\s*"((?:\\.|[^"\\])*)"\s+"((?:\\.|[^"\\])*)"\s*(.*)$', line
-        )
-        if explicit_name_match:
-            speaker = f'"{explicit_name_match.group(1)}"'
-            text = explicit_name_match.group(2)
-            trailing_args = explicit_name_match.group(3).strip()
-            tags = re.findall(r'\{.*?\}|\[.*?\]', text)
-            stmt_args = [trailing_args] if trailing_args else []
-
-            blocks.append(
-                {
-                    'original': line,
-                    'speaker': speaker,
-                    'text': text,
-                    'tags': tags,
-                    'stmt_args': stmt_args,
-                    'line_number': i + 1,
-                }
-            )
-            continue
-
-        # Match dialogue lines (e.g., `e "Hello{w=0.5}, world!"`)
-        match = re.match(r'^(\s*[a-zA-Z0-9_]*\s*)"(.*)"\s*', line)
-        if not match:
-            continue
-
-        speaker = match.group(1).strip()
-        # do not translate what 'old' says, it is a keyword
-        if speaker == 'old':
-            continue
-        text = match.group(2)
-        tags = re.findall(r'\{.*?\}|\[.*?\]', text)
-        # s "What is a visual novel?" nointeract
-        stmt_args = re.findall(
-            r'^\s*[a-zA-Z0-9_]*\s*"(?:\\.|[^"\\])*"\s*(\S+(?:\s+\S+)*)', line
-        )
-
-        blocks.append(
-            {
-                'original': line,
-                'speaker': speaker,
-                'text': text,
-                'tags': tags,
-                'stmt_args': stmt_args,
+        match = pattern.match(line)
+        if match:
+            extracted_text = match.group(1)
+            # Use 1-based index for line numbers to make debugging easier
+            blocks.append({
+                'id': len(blocks) + 1,
+                'text': extracted_text,
                 'line_number': i + 1,
-            }
-        )
+                'raw_line': line
+            })
 
     return blocks
 
 
-def generate_llm_prompt(blocks, target_lang):
+def translate_batch_with_llm(blocks, src_lang, dst_lang):
     """
-    Formats blocks into an LLM prompt with strict instructions.
+    Sends a batch of blocks to the LLM and asks for a JSON array response.
     """
-    examples = """
-Example Input:
+    # Create an array containing only id and text to optimize context/tokens
+    payload = [{'id': b['id'], 'text': b['text']} for b in blocks]
 
-<1> e "Hello{w=0.5}, world!{fast}"
-<3> s "What is a visual novel?"
-<15> ai "Let's make a game, {w} a very good one, with [c]!"
-<99> f "{i}{alpha=.6}\"What's going on...?{w} Why is she crying now...?!\"{/alpha}{i}"
-<112> "Score: %s points"
-<156> "I am the narrator, and I will guide you through this game."
-<177> g "My first name is [player.names[0]]."
-<203> g "You achieved [100.0 * points / max_points:.2] scores!"
-<205> so "Hello, Natsuki! My name is Sora."
-<208> n "You are very happy to see Sora, as you have been waiting for her for a long time."
+    prompt = (
+        f"You are an automated game localization engine. Translate the text fields in the provided JSON array from {src_lang} into {dst_lang}.\n\n"
+        f"Task Instructions:\n"
+        f"- Translate only the \"text\" values into natural, flowing {dst_lang}.\n"
+        f"- CRITICAL: Keep all internal curly-brace tags completely unchanged, such as {{#weekday_short}} or {{#month}}. Do NOT translate or alter text inside `{{#...}}`.\n"
+        f"- CRITICAL: Keep all variable brackets completely unchanged, such as [text], [identifier], or [renpy.display.tts.last]. Do NOT translate text inside square brackets `[...]`.\n"
+        f"- Keep all Ren'Py tags (e.g., {{w}}, {{fast}}, %s) exactly as they are.\n"
+        f"- Retain formatting characters like '\\n' or '\\t' if they are present in the source strings.\n"
+        f"- Do NOT change the \"id\" values.\n"
+        f"- Respond strictly with a valid JSON array matching the exact structure received. Do not wrap the JSON output in markdown blocks (like ```json ... ```) or append explanation prose.\n\n"
+        """Example:
+        Input JSON:
+        [
+        {{"id": 1, "text": "Hello{{w=0.5}}, world!{{fast}}"}},
+        {{"id": 2, "text": "{{#weekday_short}}Sun"}},
+        {{"id": 3, "text": "skip unseen [text]"}}
+        ]
+        Output JSON:
+        [
+        {{"id": 1, "text": "Olá{{w=0.5}}, mundo!{{fast}}"}},
+        {{"id": 2, "text": "{{#weekday_short}}Dom"}},
+        {{"id": 3, "text": "pular não visto [text]"}}
+        ]
 
-Example Output:
-
-<1> e "你好{w=0.5}, 世界!{fast}"
-<3> s "什么是视觉小说？"
-<15> ai "让我们制作一个游戏，{w} 一个非常好的游戏，和[c]一起！"
-<99> f "{i}{alpha=.6}\"发生了什么事...?{w} 她为什么现在在哭...？！\"{/alpha}{i}"
-<112> "得分: %s 分"
-<156> "我是旁白，我将引导你完成这个游戏。"
-<177> g "我的名字是 [player.names[0]]。"
-<203> g "你获得了 [100.0 * points / max_points:.2] 分！"
-<205> so "你好，Natsuki！我叫Sora。"
-<208> n "你非常高兴见到Sora，因为你已经等她很久了。"
-    """.strip()
-
-    instructions = f"""
-Translate these Ren'Py game dialogues to {target_lang}. Follow these rules:
-1. Preserve ALL tags ({{...}}, [...], etc.), speaker labels, and formatting EXACTLY.
-2. Preserve ALL line numbers at the beginning EXACTLY, and translate line by line.
-3. Preserve ALL character names in the ORIGINAL language.
-4. Keep placeholders like %s unchanged.
-5. Never add/remove quotes or line breaks.
-
-{examples}
-
-Now translate these:
-    """.strip()
-
-    text_to_translate = '\n'.join(
-        f'<{block["line_number"]}> {block["speaker"]} "{block["text"]}"'
-        for block in blocks
+        Translate this JSON array from {src_lang} into {dst_lang}:"""
+        f"Input Data:\n"
+        f"{json.dumps(payload, ensure_ascii=False, indent=4)}"
     )
 
-    return f'{instructions}\n{text_to_translate}'
-
-
-def call_llm_api(prompt):
-    """
-    Calls the LLM API with the constructed prompt.
-    Adjust according to your API's requirements.
-    """
     try:
         response = client.chat.completions.create(
             model=LLM_MODEL,
             messages=[
-                {
-                    'role': 'system',
-                    'content': 'You are a professional game translator.',
-                },
-                {'role': 'user', 'content': prompt},
+                {"role": "system", "content": "You are a professional localizer specializing in video games and interactive novels."},
+                {"role": "user", "content": prompt}
             ],
-            temperature=0.3,
-            # max_tokens=4000,
-            stream=False,
+            temperature=0.2,
         )
 
-        return response.choices[0].message.content
+        response_text = response.choices[0].message.content.strip()
+
+        if DEBUG == 'True':
+            print(f"\n--- [DEBUG LLM RESPONSE] ---")
+            print(response_text)
+            print(f"-----------------------------\n")
+
+        return response_text
+
     except Exception as e:
-        print(f'Retrying... Error: {e}')
+        print(f"API Error during translation: {e}")
+        return None
 
-    raise Exception('LLM API failed after retries')
+
+def chunk_list(lst, n):
+    """Yield successive n-sized chunks from lst."""
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
 
 
-def validate_translation(original_block, translated_line):
+def process_rpy_file(in_file_path, out_file_path, src_lang, dst_lang, overwrite=False, chunk_size=50):
     """
-    Checks if tags, speakers, etc. are preserved.
+    Parses an .rpy file, extracts target texts, translates them in batches via the LLM,
+    and reconstructs the updated file structure in the output destination.
     """
-    # Check line number
-    orig_ln = original_block['line_number']
-    try:
-        trans_ln = int(re.findall(r'^<(\d+)>', translated_line)[0])
-    except IndexError:
-        print(f'Line number not found in translated line: {translated_line}')
-        return False
-
-    if orig_ln != trans_ln:
-        print(f'Line number mismatch: Original {orig_ln} vs Translated {trans_ln}')
-        return False
-
-    # Check speaker
-    orig_speaker = original_block['speaker']
-    speaker_match = re.match(
-        r'^<\d+>\s*("((?:\\.|[^"\\])*)"|[a-zA-Z0-9_]*)\s*"', translated_line
-    )
-    if not speaker_match:
-        print(f'Speaker not found in translated line: {translated_line}')
-        return False
-    trans_speaker = speaker_match.group(1).strip()
-    if orig_speaker != trans_speaker:
-        print(
-            f'Speaker mismatch: Original {orig_speaker} vs Translated {trans_speaker}'
-        )
-        return False
-
-    # Check tags
-    orig_tags = original_block['tags']
-    trans_tags = re.findall(r'\{.*?\}|\[.*?\]', translated_line)
-    if set(orig_tags) != set(trans_tags):
-        print(f'Tag mismatch:\nOriginal: {orig_tags}\nTranslated: {trans_tags}')
-        return False
-
-    return True
-
-
-def process_rpy_file(in_path, out_path, target_lang):
-    """
-    Main pipeline: Read -> Extract -> Translate -> Validate -> Write.
-    """
-    print(f'Processing {in_path} -> {out_path} ({target_lang})')
-
-    # Read input file
-    with open(in_path, 'r', encoding='utf-8') as f:
-        content = f.read()
-
-    # Extract translatable blocks
-    blocks = extract_translatable_blocks(content)
-    if not blocks:
-        print('No translatable dialogue found.')
+    if out_file_path.exists() and not overwrite:
+        print(f"Skipping file: '{out_file_path.name}' (Already exists in output path. Use --overwrite to force refresh).")
         return
 
-    # Generate LLM prompt and call API
-    prompt = generate_llm_prompt(blocks, target_lang)
-    translated_response = call_llm_api(prompt)
+    with open(in_file_path, 'r', encoding='utf-8') as f:
+        content = f.read()
 
-    # Parse LLM response
-    translated_lines = [
-        line.strip()
-        for line in translated_response.split('\n')
-        if line.strip() and '"' in line
-    ]
+    blocks = extract_translatable_blocks(content)
 
-    # check if all blocks are translated
-    if len(blocks) != len(translated_lines):
-        print(
-            f'Warning: {len(translated_lines)} lines translated, but there are {len(blocks)} translate blocks.'
-        )
+    if not blocks:
+        print(f"No strings found to translate in '{in_file_path.name}'. Copying file directly.")
+        out_file_path.write_text(content, encoding='utf-8')
+        return
 
-    # Reintegrate translations
-    output_lines = content.split('\n')
-    err_cnt = 0
-    for block, translated_line in zip(blocks, translated_lines):
-        if not validate_translation(block, translated_line):
-            err_cnt += 1
-            print(
-                f'Validation failed for block: {block}\nTranslated line: {translated_line}'
-            )
-        # remove line number from translted line
-        translated_line = re.sub(r'^<\d+>\s*', '', translated_line)
-        output_lines[block['line_number'] - 1] = '    ' + ' '.join(
-            [translated_line, *block['stmt_args']]
-        )
-    if err_cnt:
-        print(f'{err_cnt} errors encountered.')
+    print(f"Processing '{in_file_path.name}': Found {len(blocks)} strings to translate.")
 
-    # Write output
-    with open(out_path, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(output_lines))
+    lines = content.split('\n')
+    chunks = list(chunk_list(blocks, chunk_size))
+    total_chunks = len(chunks)
 
-    print(f'Successfully translated {len(blocks)} lines.')
+    for idx, chunk in enumerate(chunks, 1):
+        print(f"Translating batch {idx}/{total_chunks}...")
+
+        llm_response = translate_batch_with_llm(chunk, src_lang, dst_lang)
+        if not llm_response:
+            print(f"Error: Unable to get translation for batch {idx}. Aborting file to prevent script corruption.")
+            return
+
+        try:
+            # strict=False handles literal unescaped control characters (like tabs/newlines) inside LLM-returned text strings
+            translated_data = json.loads(llm_response, strict=False)
+        except json.JSONDecodeError as je:
+            print(f"CRITICAL ERROR: Failed to decode JSON response from batch {idx}: {je}")
+            print("Aborting file write operations to avoid breaking the script structure.")
+            return
+
+        # Build an easy-lookup dictionary from the translated data
+        translation_map = {}
+        for item in translated_data:
+            if isinstance(item, dict) and 'id' in item and 'text' in item:
+                translation_map[item['id']] = item['text']
+
+        # Replace the original strings inside the line buffer
+        for block in chunk:
+            block_id = block['id']
+            if block_id in translation_map:
+                translated_text = translation_map[block_id]
+
+                # Reconstruct the line preserving the indentation layout
+                raw_line = block['raw_line']
+                indentation = raw_line[:len(raw_line) - len(raw_line.lstrip())]
+
+                # Format the newly updated translation line
+                new_line = f'{indentation}new "{translated_text}"'
+
+                # Match line index conversion (1-based to 0-based index adjustments)
+                line_idx = block['line_number'] - 1
+                lines[line_idx] = new_line
+            else:
+                print(f"Warning: Id {block_id} was missing from the returned translation payload. Keeping original text.")
+
+    # Reassemble and save the finalized script file
+    finalized_content = '\n'.join(lines)
+    out_file_path.write_text(finalized_content, encoding='utf-8')
+    print(f"Successfully saved translated script to: '{out_file_path}'")
+
+
+def process_directory_recursive(input_dir, output_dir, src_lang, dst_lang, overwrite, chunk_size):
+    """
+    Recursively scans and processes all .rpy files found inside a specific directory.
+    """
+    for item in input_dir.rglob('*.rpy'):
+        # Get matching relative structural paths to mirror output layouts
+        rel_path = item.relative_to(input_dir)
+        target_out_path = output_dir / rel_path
+
+        # Build missing parent directory branches dynamically
+        target_out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        process_rpy_file(item, target_out_path, src_lang, dst_lang, overwrite, chunk_size)
 
 
 # ========================
-# CLI Interface
+# Main Execution Pipeline
 # ========================
-if __name__ == '__main__':
+def main():
     parser = argparse.ArgumentParser(
-        description="Automatically translate Ren'Py (.rpy) scripts using an LLM API."
+        description="Automated Ren'Py Visual Novel Script Translator Engine leveraging LLM Capabilities."
     )
-    parser.add_argument(
-        'input_folder',
-        help='Path to the input folder that contains the .rpy files to be translated.',
-    )
-    parser.add_argument(
-        'output_folder', help='Path to the output folder for the translated .rpy files.'
-    )
-    parser.add_argument(
-        '--lang', required=True, help='Target language (e.g., "chinese")'
-    )
+    parser.add_argument('input_folder', type=str, help="Path to the input file or base translation directory containing script nodes.")
+    parser.add_argument('output_folder', type=str, help="Destination directory where generated translated files will be organized.")
+    parser.add_argument('--src-lang', type=str, default='English', help="Source language identifier signature (Default: English).")
+    parser.add_argument('--dst-lang', type=str, default=None, help="Explicit destination language name (e.g., 'Traditional Chinese'). If using --batch-mode, this argument is ignored.")
+    parser.add_argument('--overwrite', action='store_true', help="Force overwrite files if they already exist in the output path directory.")
+    parser.add_argument('--chunk-size', type=int, default=50, help="Number of translatable text strings bundled into each individual LLM payload chunk (Default: 50).")
+    parser.add_argument('--batch-mode', action='store_true', help="Scans input directory subfolders matching known names inside LANGUAGE_MAP and translates all of them automatically.")
+
     args = parser.parse_args()
 
-    # Verify paths
-    input_path = Path(args.input_folder)
-    if not input_path.exists():
-        raise FileNotFoundError(f'Input folder not found: {input_path}')
+    input_base = Path(args.input_folder)
+    output_dir = Path(args.output_folder)
 
-    output_path = Path(args.output_folder)
-    output_path.mkdir(parents=True, exist_ok=True)
+    if not input_base.exists():
+        raise FileNotFoundError(f"Input path structural location error: Targeted reference does not exist: {input_base}")
 
-    # read .rpyignore
-    ignore_set = set()
-    ignore_file = input_path.joinpath('.rpyignore')
-    if ignore_file.exists():
-        try:
-            with open(ignore_file, 'r', encoding='utf-8') as f:
-                ignore_set = set(
-                    line.strip()
-                    for line in f
-                    if line.strip() and not line.startswith('#')
-                )
-        except UnicodeDecodeError:
-            print(
-                f'Warning: ignore file {ignore_file} is not a Unicode file, skipping.'
-            )
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    for in_file_path in input_path.glob('**/*.rpy'):
-        # get relative path
-        rel_path = in_file_path.relative_to(input_path)
+    # MODE 1: Batch Directory Automation Mode
+    if args.batch_mode:
+        if not input_base.is_dir():
+            raise ValueError("Error: Input target must be a valid root directory folder when enabling --batch-mode processing options.")
 
-        if str(rel_path) in ignore_set:
-            continue
+        # Gather immediate subdirectories representing separate language folders
+        subfolders = [f for f in input_base.iterdir() if f.is_dir()]
+        print(f"\n[BATCH] Batch mode active. Detected {len(subfolders)} subdirectories inside {input_base}.\n")
 
-        out_file_path = output_path / rel_path
-        out_file_path.parent.mkdir(parents=True, exist_ok=True)
+        for folder in subfolders:
+            folder_name = folder.name
 
-        # run translation
-        process_rpy_file(in_file_path, out_file_path, args.lang)
+            # Check if the folder name matches a configuration inside LANGUAGE_MAP
+            if folder_name in LANGUAGE_MAP:
+                detected_dst_lang = LANGUAGE_MAP[folder_name]
+                print(f"\n[BATCH] Starting processing for folder '{folder_name}' -> Target Language: {detected_dst_lang}")
 
-        ignore_set.add(str(rel_path))
+                # Mirror the language folder name layout inside the primary output directory path
+                target_output_dir = output_dir / folder_name
+                process_directory_recursive(folder, target_output_dir, args.src_lang, detected_dst_lang, args.overwrite, args.chunk_size)
+            else:
+                print(f"\n[BATCH] Notice: Folder '{folder_name}' skipped. No matching translation mapping found in LANGUAGE_MAP.")
 
-        # update .rpyignore
-        with open(ignore_file, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(sorted(ignore_set)))
+        print("\n[BATCH] All mapped language batch translation pipelines completed successfully!")
+
+    # MODE 2: Standard Individual File / Target Directory Mode
+    else:
+        if input_base.is_file():
+            if input_base.suffix != '.rpy':
+                raise ValueError(f"Target script file format mismatch exception. Expected an '.rpy' extension. Received: {input_base.name}")
+
+            out_file_path = output_dir / input_base.name
+            process_rpy_file(input_base, out_file_path, args.src_lang, args.dst_lang, args.overwrite, args.chunk_size)
+
+        elif input_base.is_dir():
+            if not args.dst_lang:
+                raise ValueError("Missing parameter: An explicit target translation language must be defined via `--dst-lang` when processing standard directories.")
+
+            print(f"\nScanning workspace directory target structure: '{input_base}' -> Export Target: '{args.dst_lang}'\n")
+            process_directory_recursive(input_base, output_dir, args.src_lang, args.dst_lang, args.overwrite, args.chunk_size)
+
+
+if __name__ == '__main__':
+    main()
